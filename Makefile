@@ -52,3 +52,7 @@ priv-instr-table.tex: latex
 .PHONY: inst.spinalhdl
 inst.spinalhdl:
 	@./parse.py -spinalhdl $(EXTENSIONS)
+
+.PHONY : linux
+linux:
+	@./parse_linux.py $(OUTPUT_FILE_PATH) $(CONFIG_FILE_PATH) --extensions $(EXTENSIONS)
