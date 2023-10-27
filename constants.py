@@ -22,7 +22,7 @@ pseudo_regex = re.compile(
     '^\$pseudo_op\s+(?P<filename>rv[\d]*_[\w].*)::\s*(?P<orig_inst>.*?)\s+(?P<pseudo_inst>.*?)\s+(?P<overload>.*)$'
 , re.M)
 
-imported_regex = re.compile('^\s*\$import\s*(?P<extension>.*)\s*::\s*(?P<instruction>.*)', re.M)
+imported_regex = re.compile(r'^\s*\$import\s*(?P<extension>[^::\s]*)\s*(?:::\s*(?P<instruction>.*))?')
 
 causes = []
 with open("causes.csv") as f:

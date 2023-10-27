@@ -188,6 +188,14 @@ def create_inst_dict(file_filter, include_pseudo=False, include_pseudo_ops=[]):
     for fil in file_filter:
         file_names += glob.glob(f'{opcodes_dir}/{fil}')
     file_names.sort(reverse=True)
+
+    # Can do one pass. Create queue of all filenames to parse
+    # When encounter import/pseudo, add onto the queue and dict of import/pseudo to parse
+    # When processing file, first check if it has been processed yet
+    #   If not read file and cache
+    #   If it has, process all remaining import/pseudo instructions and remove them from list
+
+
     # first pass if for standard/regular instructions
     logging.debug('Collecting standard instructions first')
     for f in file_names:
@@ -335,59 +343,64 @@ def create_inst_dict(file_filter, include_pseudo=False, include_pseudo_ops=[]):
             # The variable 'line' will now point to the new line from the
             # imported file
 
-            # ignore all lines starting with $import and $pseudo
-            if '$import' not in line :
+            import_match = imported_regex.match(line)
+            # ignore all lines not starting with $import
+            if not import_match:
                 continue
-            logging.debug(f'     Processing line: {line}')
 
-            (import_ext, reg_instr) = imported_regex.findall(line)[0]
+            import_ext, reg_instr = import_match.groups()
             import_ext_file = f'{opcodes_dir}/{import_ext}'
+            logging.debug(f'     Processing line: {line}')
 
             # check if the file of the dependent extension exist. Throw error if
             # it doesn't
             if not os.path.exists(import_ext_file):
                 ext1_file = f'{opcodes_dir}/unratified/{import_ext}'
                 if not os.path.exists(ext1_file):
-                    logging.error(f'Instruction {reg_instr} in {f} cannot be imported from {import_ext}')
+                    logging.error(f'Extension {import_ext} referenced in {f} does not exist.')
                     raise SystemExit(1)
                 else:
                     ext_file = ext1_file
             else:
                 ext_file = import_ext_file
 
-            # check if the dependent instruction exist in the dependent
-            # extension. Else throw error.
-            found = False
-            for oline in open(ext_file):
-                if not re.findall(f'^\s*{reg_instr}\s+',oline):
-                    continue
-                else:
-                    found = True
-                    break
-            if not found:
-                logging.error(f'imported instruction {reg_instr} not found in {ext_file}. Required by {line} present in {f}')
-                logging.error(f'Note: you cannot import pseudo/imported ops.')
-                raise SystemExit(1)
+            if reg_instr:
+                # check if the dependent instruction exist in the dependent
+                # extension. Else throw error.
+                imported_insts = []
+                with open(ext_file) as file:
+                    found = re.search(rf'^\s*{reg_instr}\s+', file.read())
+                    if found:
+                        imported_insts.append(found)
 
-            # call process_enc_line to get the data about the current
-            # instruction
-            (name, single_dict) = process_enc_line(oline, f)
-
-            # if an instruction has already been added to the filtered
-            # instruction dictionary throw an error saying the given
-            # instruction is already imported and raise SystemExit
-            if name in instr_dict:
-                var = instr_dict[name]["extension"]
-                if instr_dict[name]['encoding'] != single_dict['encoding']:
-                    err_msg = f'imported instruction : {name} in '
-                    err_msg += f'{f.split("/")[-1]} is already '
-                    err_msg += f'added from {var} but each have different encodings for the same instruction'
-                    logging.error(err_msg)
+                if not found:
+                    logging.error(f'imported instruction {reg_instr} not found in {ext_file}. Required by {line} present in {f}')
+                    logging.error(f'Note: you cannot import pseudo/imported ops.')
                     raise SystemExit(1)
-                instr_dict[name]['extension'].extend(single_dict['extension'])
+
+                # call process_enc_line to get the data about the current
+                # instruction
+                (name, single_dict) = process_enc_line(oline, f)
+
+                # if an instruction has already been added to the filtered
+                # instruction dictionary throw an error saying the given
+                # instruction is already imported and raise SystemExit
+                if name in instr_dict:
+                    var = instr_dict[name]["extension"]
+                    if instr_dict[name]['encoding'] != single_dict['encoding']:
+                        err_msg = f'imported instruction : {name} in '
+                        err_msg += f'{f.split("/")[-1]} is already '
+                        err_msg += f'added from {var} but each have different encodings for the same instruction'
+                        logging.error(err_msg)
+                        raise SystemExit(1)
+                    instr_dict[name]['extension'].extend(single_dict['extension'])
+                else:
+                    # update the final dict with the instruction
+                    instr_dict[name] = single_dict
             else:
-                # update the final dict with the instruction
-                instr_dict[name] = single_dict
+                # Importing all instructions from extension
+                # Call function to process new file (if it hasn't been processed already)
+
     return instr_dict
 
 def make_priv_latex_table():
