@@ -1,5 +1,12 @@
 import pathlib
 
+class Instruction:
+    encoding
+    variable_fields
+    extension
+    match
+    mask
+
 def create_inst_dict2(file_filter:str, include_pseudo:bool = False, include_pseudo_ops: list[str] | None = None):
     # Can do one pass. Create queue of all filenames to parse
     # When encounter import/pseudo, add onto the queue and dict of import/pseudo to parse
