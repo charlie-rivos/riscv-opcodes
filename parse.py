@@ -229,6 +229,7 @@ def create_inst_dict(file_filter, include_pseudo=False, include_pseudo_ops=[]):
             # instruction dictionary throw an error saying the given
             # instruction is already imported and raise SystemExit
             if name in instr_dict:
+                print(name)
                 var = instr_dict[name]["extension"]
                 if same_base_ext(ext_name, var):
                     # disable same names on the same base extensions
@@ -386,6 +387,7 @@ def create_inst_dict(file_filter, include_pseudo=False, include_pseudo_ops=[]):
                 # instruction dictionary throw an error saying the given
                 # instruction is already imported and raise SystemExit
                 if name in instr_dict:
+                    print(name)
                     var = instr_dict[name]["extension"]
                     if instr_dict[name]['encoding'] != single_dict['encoding']:
                         err_msg = f'imported instruction : {name} in '
