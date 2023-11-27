@@ -1,18 +1,18 @@
 from dataclasses import dataclass
-from enum import IntFlag, auto
+from enum import Enum, IntFlag, auto
 import pathlib
 import re
-from typing import Generator
+from typing import Generator, Literal
 
 
 numeric_arg_regex = re.compile(
-    r"(?P<msb>\d+)(?:\.\.(?P<lsb>\d+))?\s*=\s*(?P<val>(?:(0x[a-zA-Z0-9]+)|(\d+)))"
+    r"(?P<msb>\d+)(?:\.\.(?P<lsb>\d+))?\s*=\s*(?P<val>(?:0x[a-zA-Z0-9]+)|(?:\d+))"
 )
 import_line_regex = re.compile(
     r"\$import\s+(?P<import_extension>[^::]+)::(?P<import_instruction>[^\s]+)"
 )
 pseudo_line_regex = re.compile(
-    r"\$import\s+(?P<import_extension>[^::]+)::(?P<import_instruction>[^\s]+)\s+(?P<name>[^\s]+)\s+(?P<arg_list>.*)"
+    r"\$pseudo_op\s+(?P<import_extension>[^::]+)::(?P<import_instruction>[^\s]+)\s+(?P<name>[^\s]+)\s+(?P<arg_list>.*)"
 )
 instruction_line_regex = re.compile(r"(?P<name>[^\s]+)\s+(?P<arg_list>.*)")
 
@@ -36,12 +36,16 @@ class NumericArg:
     lsb: int
     value: int
 
+    def bit_value(self) -> str:
+        ret_val = f"{self.value:0{(self.msb - self.lsb) + 1}b}"
+        return ret_val
+
     def assert_valid(self):
         if self.lsb > self.msb:
             raise Exception("Invalid range")
 
-        num_bits: int = self.lsb - self.msb + 1
-        if self.value.bit_length() >= num_bits:
+        num_bits: int = self.msb - self.lsb + 1
+        if self.value.bit_length() > num_bits:
             raise Exception(
                 f"Value of {self.value} too large to fit in specified number of bits ({num_bits})"
             )
@@ -52,20 +56,16 @@ class NumericArg:
         if numeric_arg_match:
             msb, lsb, value = numeric_arg_match.groups()
             if lsb == None:
-                msb = int(msb) + 1
-            return NumericArg(int(msb), int(msb), int(value))
+                lsb = int(msb)
+            return NumericArg(int(msb), int(lsb), int(value, 16))
         return None
 
 
 @dataclass(frozen=True)
-class IntermediateInstruction:
+class PseudoInstruction:
     extension: str
     import_extension: str
     import_name: str
-
-
-@dataclass(frozen=True)
-class PseudoInstruction(IntermediateInstruction):
     name: str
     encoding: str
     mask: str
@@ -74,15 +74,17 @@ class PseudoInstruction(IntermediateInstruction):
 
 
 @dataclass(frozen=True)
-class ImportInstruction(IntermediateInstruction):
-    pass
+class ImportInstruction:
+    extension: str
+    import_extension: str
+    import_name: str
 
 
 @dataclass(frozen=True)
 class Instruction:
     name: str
     encoding: str
-    extensions: tuple[str]
+    extension: list[str]
     mask: str
     match: str
     args: tuple[str, ...]
@@ -116,7 +118,11 @@ def parse_arg_list(encoding_size: int, arg_list: str) -> ArgList:
         numeric_arg = NumericArg.from_string(arg)
         if numeric_arg:
             numeric_arg.assert_valid()
-            arg_mask = (encoding_bits >> numeric_arg.lsb) << numeric_arg.lsb
+
+            # Generate bit mask in range of msb:lsb
+            arg_mask = (encoding_bits - (1 << numeric_arg.lsb) + 1) & (
+                encoding_bits >> (encoding_size - 1 - numeric_arg.msb)
+            )
             if arg_mask & insn_mask:
                 print("Overlapping bits in instruction")
                 exit(1)
@@ -124,11 +130,13 @@ def parse_arg_list(encoding_size: int, arg_list: str) -> ArgList:
             arg_match = numeric_arg.value << numeric_arg.lsb
             insn_match = insn_match | arg_match
 
-            # Replace relevant "don't care" values from arg values
+            # Replace relevant "don't care" values from arg values.
+            # Index from the back since instructions are little-endian but
+            # indexing is big-endian
             insn_encoding = (
-                insn_encoding[: numeric_arg.msb]
-                + bin(numeric_arg.value)
-                + insn_encoding[numeric_arg.lsb + 1 :]
+                insn_encoding[: encoding_size - (numeric_arg.msb + 1)]
+                + numeric_arg.bit_value()
+                + insn_encoding[encoding_size - (numeric_arg.lsb) :]
             )
         else:
             named_args.append(arg)
@@ -152,7 +160,7 @@ def get_arch_size(extension: str) -> ArchSize:
 
 def get_instructions(
     filename: pathlib.Path,
-) -> Generator[Instruction | IntermediateInstruction, None, None]:
+) -> Generator[Instruction | PseudoInstruction | ImportInstruction, None, None]:
     """
     Given a path to a file, parse all of the instructions in the file. This only
     returns IntermediateInstructions because this function does not follow the
@@ -172,10 +180,10 @@ def get_instructions(
                             f"Malformed import instruction ({line}) in file ({filename})"
                         )
                     import_instruction_dict = parsed_import_instruction.groupdict()
-                    import_extension = import_instruction_dict["import_extension"]
-                    import_instruction = import_instruction_dict["import_instruction"]
                     yield ImportInstruction(
-                        extension, import_extension, import_instruction
+                        extension,
+                        import_instruction_dict["import_extension"],
+                        import_instruction_dict["import_instruction"],
                     )
                 elif stripped_line.startswith("$pseudo_op"):
                     parsed_pseudo_instruction = pseudo_line_regex.match(stripped_line)
@@ -184,20 +192,15 @@ def get_instructions(
                             f"Malformed pseudo instruction ({line}) in file ({filename})"
                         )
                     pseudo_instruction_dict = parsed_pseudo_instruction.groupdict()
-                    pseudo_extension = pseudo_instruction_dict["import_extension"]
-                    pseudo_instruction = pseudo_instruction_dict["import_instruction"]
                     pseudo_instruction_name = pseudo_instruction_dict["name"]
-                    pseudo_instruction_encoding_size = get_encoding_size(
-                        pseudo_instruction_name
-                    )
-                    pseudo_arg_list = pseudo_instruction_dict["arg_list"]
                     parsed_pseudo_arg_list = parse_arg_list(
-                        pseudo_instruction_encoding_size, pseudo_arg_list
+                        get_encoding_size(pseudo_instruction_name),
+                        pseudo_instruction_dict["arg_list"],
                     )
                     yield PseudoInstruction(
                         extension,
-                        pseudo_extension,
-                        pseudo_instruction,
+                        pseudo_instruction_dict["import_extension"],
+                        pseudo_instruction_dict["import_instruction"],
                         pseudo_instruction_name,
                         parsed_pseudo_arg_list.insn_encoding,
                         parsed_pseudo_arg_list.insn_mask,
@@ -213,59 +216,61 @@ def get_instructions(
                         )
                     instruction_dict = parsed_instruction.groupdict()
                     instruction_name = instruction_dict["name"]
-                    instruction_encoding_size = get_encoding_size(instruction_name)
-                    arg_list = instruction_dict["arg_list"]
                     parsed_arg_list = parse_arg_list(
-                        instruction_encoding_size, arg_list
+                        get_encoding_size(instruction_name),
+                        instruction_dict["arg_list"],
                     )
-                    arch_size = get_arch_size(extension)
                     yield Instruction(
                         instruction_name,
                         parsed_arg_list.insn_encoding,
-                        (extension,),
+                        [extension],
                         parsed_arg_list.insn_mask,
                         parsed_arg_list.insn_match,
                         parsed_arg_list.named_args,
-                        arch_size,
+                        get_arch_size(extension),
                     )
 
 
-def get_file_list(file_filter: list[str]) -> list[pathlib.Path]:
-    file_list: list[pathlib.Path] = []
-    extensions_path = (pathlib.Path(__file__).parent / "extensions").resolve()
+extensions_path = (pathlib.Path(__file__).parent / "extensions").resolve()
+
+
+def get_file_list(file_filter: list[str]) -> list[tuple[pathlib.Path, bool]]:
+    file_list: list[tuple[pathlib.Path, bool]] = []
     for pattern in file_filter:
         for extension in extensions_path.glob(pattern):
-            file_list.append(extension)
-    file_list.sort(reverse=True)
-    return file_list
+            file_list.append((extension, True))
+    return sorted(file_list, reverse=True)
 
 
-def create_inst_dict(
+def get_filename(extension: str) -> pathlib.Path:
+    ratified_extension = extensions_path / extension
+    unratified_extension = extensions_path / "unratified" / extension
+    if ratified_extension.exists():
+        return ratified_extension
+    elif unratified_extension.exists():
+        return unratified_extension
+    print(f"Extension {extension} does not exist!")
+    exit(1)
+
+
+class IncludePseudoOps(Enum):
+    ALL = auto()
+
+
+def collect_instructions(
     file_filter: list[str],
-    include_pseudo: bool = False,
-    include_pseudo_ops: list[str] | None = None,
+    include_pseudo_ops: list[str] | Literal[IncludePseudoOps.ALL],
 ) -> list[Instruction]:
-    # Can do one pass. Create queue of all filenames to parse
-    # When encounter import/pseudo, add onto the queue and dict of import/pseudo to parse
-    # When processing file, first check if it has been processed yet
-    #   If not read file and cache
-    #   If it has, process all remaining import/pseudo instructions and remove them from list
+    inst_list: list[Instruction] = []
 
-    filenames_queue: list[pathlib.Path] = []
-    parsed_filenames: set[str] = set()
-    instructions_to_parse: dict[str, str] = {}
+    visited_extensions: set[pathlib.Path] = set()
+    filenames_queue: list[tuple[pathlib.Path, bool]] = []
 
-    # Dict of instruction_name: (IntermediateInstruction, list[extension_names])
-    # Used to check if instructions with the same name are overlapping
-    # It is possible for an instruction to be defined in two different extensions
-    encountered_instructions: dict[str, tuple[IntermediateInstruction, list[str]]] = {}
-
-    # Following dict is used to find an instruction that is known to be in an
-    # extension
-    # filename (also is the extension):
-    # 	instruction_name:
-    # 		instruction
-    inst_dict: dict[str, dict[str, Instruction]] = {}
+    # All of these dicts have a tuple that is (extension, instruction_name)
+    instructions_to_import: dict[tuple[str, str], ImportInstruction] = dict()
+    pseudo_instructions: dict[tuple[str, str], PseudoInstruction] = dict()
+    included_instructions: dict[tuple[str, str], Instruction] = dict()
+    inst_dict: dict[tuple[str, str], Instruction] = {}
 
     if not include_pseudo_ops:
         include_pseudo_ops = []
@@ -273,6 +278,70 @@ def create_inst_dict(
     filenames_queue = get_file_list(file_filter)
 
     while filenames_queue:
-        current_filename = filenames_queue.pop(0)
+        current_filename, include_all_insts = filenames_queue.pop(0)
+        if current_filename in visited_extensions:
+            continue
+        else:
+            visited_extensions.add(current_filename)
         for instruction in get_instructions(current_filename):
-            print(instruction)
+            match instruction:
+                case Instruction():
+                    # Will start with a single extension in the list
+                    instruction_tuple = (instruction.extension[0], instruction.name)
+                    if instruction_tuple in inst_dict:
+                        if inst_dict[instruction_tuple] != instruction:
+                            print("Duplicate instruction with different args!")
+                            exit(1)
+                        continue
+                    else:
+                        # Add instruction to instruction cache
+                        inst_dict[instruction_tuple] = instruction
+
+                    # Add instruction to list to return if contained in a
+                    # specified extension
+                    should_import = instruction_tuple in instructions_to_import
+                    should_import_pseudo = instruction_tuple in pseudo_instructions
+                    if include_all_insts or should_import or should_import_pseudo:
+                        if instruction_tuple not in included_instructions:
+                            inst_list.append(instruction)
+                            included_instructions[instruction_tuple] = instruction
+                        if should_import:
+                            del instructions_to_import[instruction_tuple]
+                        elif should_import_pseudo:
+                            del pseudo_instructions[instruction_tuple]
+                case PseudoInstruction():
+                    instruction_tuple = (
+                        instruction.import_extension,
+                        instruction.import_name,
+                    )
+
+                    # Check if instruction has been processed
+                    if instruction_tuple in inst_dict:
+                        inst_dict[instruction_tuple].extension.append(
+                            instruction.extension
+                        )
+                    # Add to list of pseudo instructions to be processed
+                    elif instruction_tuple not in pseudo_instructions:
+                        pseudo_instructions[instruction_tuple] = instruction
+                        filenames_queue.append(
+                            (get_filename(instruction.import_extension), False)
+                        )
+                    # Otherwise already queued to be processed
+                case ImportInstruction():
+                    instruction_tuple = (
+                        instruction.import_extension,
+                        instruction.import_name,
+                    )
+                    # Check if instruction has been processed
+                    if instruction_tuple in inst_dict:
+                        inst_dict[instruction_tuple].extension.append(
+                            instruction.extension
+                        )
+                    # Add to list of pseudo instructions to be processed
+                    elif instruction_tuple not in instructions_to_import:
+                        instructions_to_import[instruction_tuple] = instruction
+                        filenames_queue.append(
+                            (get_filename(instruction.import_extension), False)
+                        )
+                    # Otherwise already queued to be processed
+    return inst_list
