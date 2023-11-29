@@ -5,14 +5,15 @@ import yaml
 count = 0
 inst_dict = {}
 for instruction in parse_extensions.collect_instructions(
-    ["rv_zks"], parse_extensions.IncludePseudoOps.ALL
+    ["rv_zksed"], parse_extensions.AnyPseudoOp()
 ):
     inst_dict[instruction.name] = {
-        "args": list(instruction.args),
         "encoding": instruction.encoding,
-        "extension": instruction.extension,
+        "extension": instruction.extensions,
         "mask": instruction.mask,
         "match": instruction.match,
+        "variable_fields": list(instruction.args),
     }
 
-print(yaml.dump(inst_dict))
+with open("instr_dict2.yaml", "w") as outfile:
+    yaml.dump(inst_dict, outfile, default_flow_style=False)
