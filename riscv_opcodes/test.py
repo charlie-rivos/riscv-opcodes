@@ -5,7 +5,7 @@ import yaml
 count = 0
 inst_dict = {}
 for instruction in parse_extensions.collect_instructions(
-    ["rv_zksed"], parse_extensions.AnyPseudoOp()
+    ["rv*"], parse_extensions.AnyPseudoOp()
 ):
     inst_dict[instruction.name] = {
         "encoding": instruction.encoding,

@@ -1,1 +1,22 @@
-{}
+sm4ed:
+  encoding: --11000----------000-----0110011
+  extension:
+  - rv_zksed
+  mask: '0x3e00707f'
+  match: '0x30000033'
+  variable_fields:
+  - rd
+  - rs1
+  - rs2
+  - bs
+sm4ks:
+  encoding: --11010----------000-----0110011
+  extension:
+  - rv_zksed
+  mask: '0x3e00707f'
+  match: '0x34000033'
+  variable_fields:
+  - rd
+  - rs1
+  - rs2
+  - bs
