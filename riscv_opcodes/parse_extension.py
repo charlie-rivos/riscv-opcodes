@@ -51,6 +51,8 @@ class IntermediateInstruction:
         return InstructionTuple(self.extension, self.name)
 
 
+InstructionType = PseudoInstruction | ImportInstruction | IntermediateInstruction
+
 @dataclass(frozen=True)
 class ArgList:
     named_args: tuple[str, ...]
@@ -148,7 +150,7 @@ def parse_arg_list(encoding_size: int, arg_list: str) -> ArgList:
 def parse_extension(
     filename: pathlib.Path,
 ) -> Generator[
-    IntermediateInstruction | PseudoInstruction | ImportInstruction, None, None
+    InstructionType, None, None
 ]:
     extension = filename.name
     with open(filename) as file:

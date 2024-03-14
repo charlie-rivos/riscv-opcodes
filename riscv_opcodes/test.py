@@ -4,12 +4,14 @@ import yaml
 
 count = 0
 inst_dict = {}
-for instruction in parse_extensions.collect_instructions(
-    ["rv*"], parse_extensions.AnyPseudoOp()
+instruction_collector = parse_extensions.InstructionCollector()
+
+for instruction in instruction_collector.collect(
+    ["rv*"], set()
 ):
-    inst_dict[instruction.name] = {
+    inst_dict[instruction.name.replace(".", "_")] = {
         "encoding": instruction.encoding,
-        "extension": instruction.extensions,
+        "extension": sorted(instruction.extensions, reverse=True),
         "mask": instruction.mask,
         "match": instruction.match,
         "variable_fields": list(instruction.args),

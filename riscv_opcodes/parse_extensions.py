@@ -1,62 +1,31 @@
 from dataclasses import dataclass
-import dataclasses
-from enum import IntFlag, auto
 import pathlib
 from typing import Generator
-from riscv_opcodes.exceptions import (
+from exceptions import (
     DuplicateEncodingException,
     DuplicateInstructionException,
+    DuplicateNameException,
+    IllegalInstructionImport,
 )
+from instruction import BaseExtension, Instruction, get_base_extension
 
-from riscv_opcodes.parse_extension import (
+from parse_extension import (
     ImportInstruction,
     InstructionTuple,
+    InstructionType,
     IntermediateInstruction,
     PseudoInstruction,
     parse_extension,
 )
 
 
-class BaseExtension(IntFlag):
-    RV32 = auto()
-    RV64 = auto()
-    RV128 = auto()
-
-
-def get_base_extension(extension: str) -> BaseExtension:
-    if extension.startswith("rv32"):
-        return BaseExtension.RV32
-    elif extension.startswith("rv64"):
-        return BaseExtension.RV64
-    elif extension.startswith("rv128"):
-        return BaseExtension.RV128
-    else:
-        return BaseExtension.RV32 | BaseExtension.RV64 | BaseExtension.RV128
-
-
-def get_base_extension_from_list(extensions: list[str]) -> BaseExtension:
-    base_extension: BaseExtension = get_base_extension(extensions[0])
-
-    for extension in extensions[1:]:
-        base_extension |= get_base_extension(extension)
-
-    return base_extension
+extensions_path = (pathlib.Path(__file__).parent / "extensions").resolve()
 
 
 @dataclass(frozen=True)
-class Instruction:
-    extensions: list[str]
+class Extension:
     name: str
-    encoding: str
-    mask: str
-    match: str
-    args: tuple[str, ...]
-
-    def get_base_extension(self) -> BaseExtension:
-        return get_base_extension_from_list(self.extensions)
-
-
-extensions_path = (pathlib.Path(__file__).parent / "extensions").resolve()
+    instructions: tuple[Instruction]
 
 
 def get_file_list(file_filter: list[str]) -> list[tuple[pathlib.Path, bool]]:
@@ -83,16 +52,14 @@ class AnyPseudoOp:
         return True
 
 
-# TODO: Make add instruction function
-#       Checks for overlapping encodings in same base extension, duplicate names
-#       in same base extension
-
-
 class InstructionCollector:
     encoding_may_overlap_dict: set[InstructionTuple] = set()
     encoding_dict: dict[str, list[InstructionTuple]] = dict()
+
     collected_instructions: dict[InstructionTuple, Instruction] = {}
     instruction_cache: dict[InstructionTuple, IntermediateInstruction] = {}
+    pseudo_dependent_instructions: set[InstructionTuple]
+    name_cache: set[str] = set()
 
     instructions_to_import: dict[InstructionTuple, list[ImportInstruction]] = {}
     pseudo_instructions: dict[InstructionTuple, list[PseudoInstruction]] = {}
@@ -100,12 +67,42 @@ class InstructionCollector:
     visited_extensions: set[pathlib.Path] = set()
     filenames_queue: list[tuple[pathlib.Path, bool]] = []
 
+    def track_instruction_encoding(
+        self,
+        instruction: IntermediateInstruction,
+        ignore_overlap: set[str] = set(),
+    ):
+        # An instruction can't overlap with itself
+        # Perform a union rather than directly adding to ignore_overlap such
+        # that the original ignore_overlap set is not modified
+        ignore_overlap = ignore_overlap.union(set((instruction.name,)))
+
+        if instruction.encoding in self.encoding_dict:
+            for overlapping_inst_tuple in self.encoding_dict[instruction.encoding]:
+                overlapping_inst = self.collected_instructions[overlapping_inst_tuple]
+                if (overlapping_inst.name not in ignore_overlap) and (
+                    (
+                        get_base_extension(instruction.extension)
+                        & overlapping_inst.get_base_extension()
+                    )
+                ):
+                    raise DuplicateEncodingException(instruction, overlapping_inst)
+            self.encoding_dict[instruction.encoding].append(
+                InstructionTuple(instruction.extension, instruction.name)
+            )
+        else:
+            self.encoding_dict[instruction.encoding] = [
+                (InstructionTuple(instruction.extension, instruction.name))
+            ]
+
     def file_iterator(
         self, file_filter: list[str]
     ) -> Generator[tuple[pathlib.Path, bool], None, None]:
         for pattern in file_filter:
-            for extension in extensions_path.glob(pattern):
-                yield extension, True
+            for current_filename in extensions_path.glob(pattern):
+                if current_filename not in self.visited_extensions:
+                    self.visited_extensions.add(current_filename)
+                    yield current_filename, True
         # After all files in filter processed, continue onto the file queue
         while self.filenames_queue:
             current_filename, include_all_insts = self.filenames_queue.pop(0)
@@ -114,7 +111,11 @@ class InstructionCollector:
                 yield current_filename, include_all_insts
 
     def add_instruction(
-        self, intermediate_inst: IntermediateInstruction, in_selected_extension: bool
+        self,
+        intermediate_inst: IntermediateInstruction,
+        in_selected_extension: bool,
+        ignore_overlap: set[str] = set(),
+        from_pseudo: bool = False,
     ):
         """Add an instruction to the collected_instructions dict, along with all
         of the necessary bookkeeping.
@@ -127,12 +128,20 @@ class InstructionCollector:
                                       be False if this extension is only imported
                                       for a subset of its instructions, and not
                                       requested by the original caller.
+            ignore_overlap (set[InstructionTuple]): Don't error if the instruction
+                                                    to add overlaps with an instruction
+                                                    in this set.
         """
         inst_tuple: InstructionTuple = intermediate_inst.instruction_tuple()
         if inst_tuple in self.instruction_cache:
             raise DuplicateInstructionException(intermediate_inst)
-        else:
+
+        self.name_cache.add(intermediate_inst.name)
+
+        if not from_pseudo:
             self.instruction_cache[inst_tuple] = intermediate_inst
+
+        self.track_instruction_encoding(intermediate_inst, ignore_overlap)
 
         # Construct the extension list, bringing in all of the extensions that
         # have imported this instruction before this point
@@ -141,45 +150,30 @@ class InstructionCollector:
             extension_list.append(intermediate_inst.extension)
 
         if inst_tuple in self.instructions_to_import:
+            if from_pseudo:
+                raise IllegalInstructionImport(
+                    f"Attempted to import {inst_tuple} which is a pseudo instruction. This is not supported."
+                )
             for import_instruction in self.instructions_to_import[inst_tuple]:
                 extension_list.append(import_instruction.extension)
             del self.instructions_to_import[inst_tuple]
 
-        inst: Instruction = Instruction(
-            extension_list,
-            intermediate_inst.name,
-            intermediate_inst.encoding,
-            intermediate_inst.mask,
-            intermediate_inst.mask,
-            intermediate_inst.args,
-        )
-
-        if intermediate_inst.encoding in self.encoding_dict:
-            # Check if the instructions that have the same encoding as this
-            # instruction share a same base extension
-            for overlapping_inst_tuple in self.encoding_dict[
-                intermediate_inst.encoding
-            ]:
-                overlapping_inst = self.collected_instructions[overlapping_inst_tuple]
-                if inst.get_base_extension() & overlapping_inst.get_base_extension():
-                    raise DuplicateEncodingException(
-                        intermediate_inst, overlapping_inst
-                    )
-                else:
-                    # A not-yet-parsed import may cause this instruction encoding
-                    # to overlap within a base instruction. Optimize this case by
-                    # keeping track of which instructions may overlap
-                    self.encoding_may_overlap_dict.add(inst_tuple)
-            self.encoding_dict[intermediate_inst.encoding].append(inst_tuple)
-
-        self.encoding_dict[intermediate_inst.encoding] = [inst_tuple]
-        self.collected_instructions[inst_tuple] = inst
+        if in_selected_extension:
+            # Don't need to check if inst_tuple in collected_instructions
+            # because was already checked if the instruction is in the
+            # instruction_cache and it's not possible to not be in the cache
+            # but be in collected_instructions
+            self.collected_instructions[inst_tuple] = Instruction(
+                extension_list,
+                intermediate_inst.name,  # TODO: It is possible for there to be two instructions with the same name. They should be merged into one.
+                intermediate_inst.encoding,
+                intermediate_inst.mask,
+                intermediate_inst.match,
+                intermediate_inst.args,
+            )
 
     def add_pseudo_instruction(
-        self,
-        instruction: PseudoInstruction,
-        include_pseudo_ops: set[str] | AnyPseudoOp,
-        in_selected_extension: bool,
+        self, instruction: PseudoInstruction, include_pseudo_ops: set[str] | AnyPseudoOp
     ):
         dependent_inst_tuple = InstructionTuple(
             instruction.import_extension,
@@ -193,15 +187,13 @@ class InstructionCollector:
         force_include_pseudo = instruction.name in include_pseudo_ops
         ignore_pseudo: bool = dependent_inst_collected and not force_include_pseudo
 
-        if not ignore_pseudo and in_selected_extension:
+        if not ignore_pseudo:
             # Add to list of pseudo instructions to be processed
             if dependent_inst_tuple not in self.pseudo_instructions:
                 self.pseudo_instructions[dependent_inst_tuple] = []
             self.pseudo_instructions[dependent_inst_tuple].append(instruction)
 
-    def add_import_instruction(
-        self, instruction: ImportInstruction, in_selected_extension: bool
-    ):
+    def add_import_instruction(self, instruction: ImportInstruction):
         instruction_tuple = InstructionTuple(
             instruction.import_extension,
             instruction.import_name,
@@ -209,200 +201,123 @@ class InstructionCollector:
 
         if instruction_tuple in self.instruction_cache:
             if instruction_tuple in self.collected_instructions:
-                # this extension to list of extensions that imported the
-                # original instruction
-                # TODO: Need to check if adding new extension causes
-                #       overlapping names/encoding in base extension
+                # Dependent instruction has been cached and used by a selected
+                # extension, need to add this extension to the extension list
                 self.collected_instructions[instruction_tuple].extensions.append(
                     instruction.extension
                 )
-                self.assert_not_overlapping(
-                    self.collected_instructions[instruction_tuple]
+                self.track_instruction_encoding(
+                    self.instruction_cache[instruction_tuple], set()
                 )
             else:
                 # Dependent instruction has been cached, but not requested by a
                 # selected extension until now
                 self.add_instruction(self.instruction_cache[instruction_tuple], True)
-        # elif include_all_insts and (instruction_tuple not in instructions_to_import):
-        #     if instruction_tuple not in instructions_to_import:
-        #         instructions_to_import[instruction_tuple] = []
-        #     instructions_to_import[instruction_tuple].append(instruction)
-        #     filenames_queue.append((get_filename(instruction.import_extension), False))
-
-    def assert_not_overlapping(self, instruction: Instruction):
-        if instruction.encoding in self.encoding_dict:
-            for overlapping_inst_tuple in self.encoding_dict[instruction.encoding]:
-                overlapping_inst = self.collected_instructions[overlapping_inst_tuple]
-                if (
-                    instruction.get_base_extension()
-                    & overlapping_inst.get_base_extension()
-                ):
-                    raise DuplicateEncodingException(instruction, overlapping_inst)
-
-    def track_instruction_encoding(self, instruction: IntermediateInstruction):
-        if instruction.encoding in self.encoding_dict:
-            for overlapping_inst_tuple in self.encoding_dict[instruction.encoding]:
-                overlapping_inst = self.collected_instructions[overlapping_inst_tuple]
-                if (
-                    get_base_extension(instruction.encoding)
-                    & overlapping_inst.get_base_extension()
-                ):
-                    raise DuplicateEncodingException(instruction, overlapping_inst)
-            self.encoding_dict[instruction.encoding].append(
-                InstructionTuple(instruction.extension, instruction.extension)
-            )
         else:
-            self.encoding_dict[instruction.encoding] = [
-                (InstructionTuple(instruction.extension, instruction.extension))
-            ]
+            # Instruction hasn't been parsed yet, add to filenames queue so it can be parsed
+            if instruction_tuple not in self.instructions_to_import:
+                self.instructions_to_import[instruction_tuple] = []
+            self.instructions_to_import[instruction_tuple].append(instruction)
+            self.filenames_queue.append(
+                (get_filename(instruction.import_extension), False)
+            )
+
+    def in_same_base_extension(
+        self, instruction: Instruction, instruction2: Instruction
+    ) -> BaseExtension:
+        return instruction.get_base_extension() & instruction2.get_base_extension()
+
+    def handle_pseudo_instructions(self, include_pseudo_ops: set[str] | AnyPseudoOp):
+        for (
+            dependent_instruction_tuple,
+            instructions,
+        ) in self.pseudo_instructions.items():
+            # A pseudo instruction should be ignored if the dependent
+            # instruction has already been collected and the pseudo
+            # instruction was not listed in @include_pseudo_ops
+            dependent_inst_collected = (
+                dependent_instruction_tuple in self.collected_instructions
+            )
+
+            for instruction in instructions:
+                force_include_pseudo = instruction.name in include_pseudo_ops
+                ignore_pseudo: bool = (
+                    dependent_inst_collected and not force_include_pseudo
+                )
+                if not ignore_pseudo:
+                    self.add_instruction(
+                        IntermediateInstruction(
+                            instruction.extension,
+                            instruction.name,
+                            instruction.encoding,
+                            instruction.mask,
+                            instruction.match,
+                            instruction.args,
+                        ),
+                        True,
+                        set((dependent_instruction_tuple.name,)),
+                    )
+
+    extension_cache: dict[str, Extension] = dict()
+    selected_instructions: list[Instruction] = list()
+    encoding_dict2: dict[str, Instruction] = dict()
+    name_dict2: dict[str, Instruction] = dict()
+
+    def assert_instruction_not_duplicated(self, instruction: Instruction):
+        duplicate_encoding: Instruction | None = self.encoding_dict2.get(
+            instruction.encoding
+        )
+        if duplicate_encoding and (duplicate_encoding != instruction):
+            raise DuplicateEncodingException(
+                instruction, self.encoding_dict2[instruction.encoding]
+            )
+
+        duplicate_name: Instruction | None = self.name_dict2.get(instruction.name)
+        if (
+            duplicate_name
+            and (duplicate_name != instruction)
+            and self.in_same_base_extension(instruction, duplicate_name)
+        ):
+            raise DuplicateNameException(
+                instruction, self.encoding_dict2[instruction.encoding]
+            )
+
+    # def get_instruction(self, intermediate_instruction: IntermediateInstruction) -> Instruction:
+    #     return self.collected_instructions[inst_tuple] = Instruction(
+    #             extension_list,
+    #             intermediate_inst.name, # TODO: It is possible for there to be two instructions with the same name. They should be merged into one.
+    #             intermediate_inst.encoding,
+    #             intermediate_inst.mask,
+    #             intermediate_inst.match,
+    #             intermediate_inst.args,
+    #         )
 
     def collect(
         self, file_filter: list[str], include_pseudo_ops: set[str] | AnyPseudoOp = set()
-    ):
+    ) -> list[Instruction]:
         for filename, in_selected_extension in self.file_iterator(file_filter):
+            instruction_list: list[Instruction] = []
             for instruction in parse_extension(filename):
                 match instruction:
                     case IntermediateInstruction():
-                        self.add_instruction(instruction, in_selected_extension)
+                        # self.add_instruction(instruction, in_selected_extension)
+                        resolved_instruction = Instruction(
+                            [],
+                            instruction.name,
+                            instruction.encoding,
+                            instruction.mask,
+                            instruction.match,
+                            instruction.args,
+                        )
+                        self.assert_instruction_not_duplicated(resolved_instruction)
                     case PseudoInstruction():
-                        self.add_pseudo_instruction(
-                            instruction, include_pseudo_ops, in_selected_extension
-                        )
+                        if in_selected_extension:
+                            self.add_pseudo_instruction(instruction, include_pseudo_ops)
                     case ImportInstruction():
-                        self.add_import_instruction(instruction, in_selected_extension)
+                        if in_selected_extension:
+                            self.add_import_instruction(instruction)
 
+        # All instructions have been parsed, now pseudo instructions can be handled
+        self.handle_pseudo_instructions(include_pseudo_ops)
 
-def collect_instructions(
-    file_filter: list[str],
-    include_pseudo_ops: set[str] | AnyPseudoOp = set(),
-) -> list[Instruction]:
-    encoding_dict: dict[str, Instruction] = dict()
-    # inst_list: list[Instruction] = []
-    collected_instructions: dict[tuple[str, str], Instruction] = {}
-
-    visited_extensions: set[pathlib.Path] = set()
-    filenames_queue: list[tuple[pathlib.Path, bool]] = []
-
-    # These dicts have a tuple as key that is (extension, instruction_name)
-    instructions_to_import: dict[tuple[str, str], list[ImportInstruction]] = dict()
-    pseudo_instructions: dict[tuple[str, str], list[PseudoInstruction]] = dict()
-    inst_dict: dict[tuple[str, str], Instruction] = {}
-
-    filenames_queue = get_file_list(file_filter)
-    while filenames_queue:
-        current_filename, include_all_insts = filenames_queue.pop(0)
-        if current_filename in visited_extensions:
-            continue
-        else:
-            visited_extensions.add(current_filename)
-
-        extension: str = current_filename.name
-        for instruction in get_instructions(current_filename):
-            match instruction:
-                case IntermediateInstruction():
-                    instruction_tuple = (extension, instruction.name)
-
-                    if instruction_tuple in inst_dict:
-                        print(
-                            f'Instruction "{instruction.name}" already defined in extension "{extension}".'
-                        )
-                        exit(1)
-                    elif instruction.encoding in encoding_dict:
-                        # TODO: Only do this check on the same base extension
-                        print(
-                            f'Instruction "{instruction.name}" in extension "{extension}" has same encoding ("{instruction.encoding}") as instruction "{encoding_dict[instruction.encoding].name}" from extensions {encoding_dict[instruction.encoding].extensions}.'
-                        )
-                        exit(1)
-                    else:
-                        # Add instruction to instruction cache
-                        inst_dict[instruction_tuple] = instruction
-                        encoding_dict[instruction.encoding] = instruction
-
-                    extension_list: list[str] = []
-                    if include_all_insts:
-                        extension_list.append(extension)
-
-                    # Now that this instruction has been parsed, add all of the
-                    # extensions that imported this extension to this
-                    # instruction's extension list
-                    if instruction_tuple in instructions_to_import:
-                        for import_instruction in instructions_to_import[
-                            instruction_tuple
-                        ]:
-                            extension_list.append(import_instruction.extension)
-                        del instructions_to_import[instruction_tuple]
-
-                    collected_instructions[instruction_tuple] = dataclasses.replace(
-                        instruction, extensions=extension_list
-                    )
-
-                case PseudoInstruction():
-                    instruction_tuple = (
-                        instruction.import_extension,
-                        instruction.import_name,
-                    )
-
-                    # A pseudo instruction should be skipped if the original
-                    # instruction has already been collected and the pseudo
-                    # instruction was not listed in @include_pseudo_ops
-                    should_skip_pseudo: bool = (
-                        instruction_tuple in collected_instructions
-                    ) and (instruction.name not in include_pseudo_ops)
-
-                    if (not (should_skip_pseudo)) and include_all_insts:
-                        # Add to list of pseudo instructions to be processed
-                        if instruction_tuple not in pseudo_instructions:
-                            pseudo_instructions[instruction_tuple] = []
-                        pseudo_instructions[instruction_tuple].append(instruction)
-                case ImportInstruction():
-                    instruction_tuple = (
-                        instruction.import_extension,
-                        instruction.import_name,
-                    )
-                    if instruction_tuple in inst_dict:
-                        if instruction_tuple in collected_instructions:
-                            # Original instruction has already been processed, add
-                            # this extension to list of extensions that imported the
-                            # original instruction
-                            # TODO: Need to check if adding new extension causes
-                            #       overlapping names/encoding in base extension
-                            collected_instructions[instruction_tuple].extensions.append(
-                                instruction.extension
-                            )
-                        else:
-                            # Import an instruction that has been cached but not
-                            # added.
-                            collected_instructions[
-                                instruction_tuple
-                            ] = dataclasses.replace(
-                                inst_dict[instruction_tuple],
-                                extensions=[instruction.extension],
-                            )
-                    elif include_all_insts and (
-                        instruction_tuple not in instructions_to_import
-                    ):
-                        if instruction_tuple not in instructions_to_import:
-                            instructions_to_import[instruction_tuple] = []
-                        instructions_to_import[instruction_tuple].append(instruction)
-                        filenames_queue.append(
-                            (get_filename(instruction.import_extension), False)
-                        )
-
-    for instruction_tuple, pseudo_instruction_list in pseudo_instructions.items():
-        for pseudo_instruction in pseudo_instruction_list:
-            if instruction_tuple in collected_instructions:
-                collected_instructions[
-                    (
-                        pseudo_instruction.extension,
-                        pseudo_instruction.name,
-                    )
-                ] = Instruction(
-                    [pseudo_instruction.extension],
-                    pseudo_instruction.name,
-                    pseudo_instruction.encoding,
-                    pseudo_instruction.mask,
-                    pseudo_instruction.match,
-                    pseudo_instruction.args,
-                )
-
-    return list(collected_instructions.values())
+        return list(self.collected_instructions.values())
